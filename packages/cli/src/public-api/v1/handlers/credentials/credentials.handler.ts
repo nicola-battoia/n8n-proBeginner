@@ -1,54 +1,159 @@
 /* eslint-disable @typescript-eslint/no-unsafe-argument */
+import { LicenseState } from '@n8n/backend-common';
 import type { CredentialsEntity } from '@n8n/db';
+import { CredentialsRepository } from '@n8n/db';
 import { Container } from '@n8n/di';
+import { hasGlobalScope } from '@n8n/permissions';
 import type express from 'express';
 import { z } from 'zod';
 
 import { CredentialTypes } from '@/credential-types';
 import { EnterpriseCredentialsService } from '@/credentials/credentials.service.ee';
 import { CredentialsHelper } from '@/credentials-helper';
+import { ResponseError } from '@/errors/response-errors/abstract/response.error';
 
-import { validCredentialsProperties, validCredentialType } from './credentials.middleware';
 import {
-	createCredential,
-	encryptCredential,
-	getCredentials,
+	validCredentialsProperties,
+	validCredentialType,
+	validCredentialTypeForUpdate,
+	validCredentialsPropertiesForUpdate,
+} from './credentials.middleware';
+import {
+	buildSharedForCredential,
+	CredentialsIsNotUpdatableError,
+	getCredential,
 	getSharedCredentials,
 	removeCredential,
 	sanitizeCredentials,
 	saveCredential,
 	toJsonSchema,
+	updateCredential,
 } from './credentials.service';
 import type { CredentialTypeRequest, CredentialRequest } from '../../../types';
-import { apiKeyHasScope, projectScope } from '../../shared/middlewares/global.middleware';
+import {
+	publicApiScope,
+	apiKeyHasScopeWithGlobalScopeFallback,
+	projectScope,
+	validCursor,
+} from '../../shared/middlewares/global.middleware';
+import { encodeNextCursor } from '../../shared/services/pagination.service';
 
 export = {
+	getCredentials: [
+		apiKeyHasScopeWithGlobalScopeFallback({ scope: 'credential:list' }),
+		validCursor,
+		async (
+			req: CredentialRequest.GetAll,
+			res: express.Response,
+		): Promise<
+			express.Response<{
+				data: Array<{
+					id: string;
+					name: string;
+					type: string;
+					createdAt: Date;
+					updatedAt: Date;
+					shared: ReturnType<typeof buildSharedForCredential>;
+				}>;
+				nextCursor: string | null;
+			}>
+		> => {
+			const offset = Number(req.query.offset) || 0;
+			const limit = Math.min(Number(req.query.limit) || 100, 250);
+
+			const repo = Container.get(CredentialsRepository);
+			const [credentials, count] = await repo.findAndCount({
+				take: limit,
+				skip: offset,
+				select: ['id', 'name', 'type', 'createdAt', 'updatedAt'],
+				relations: ['shared', 'shared.project'],
+				order: { createdAt: 'DESC' },
+			});
+
+			const data = credentials.map((credential: CredentialsEntity) => {
+				const shared = buildSharedForCredential(credential);
+				return {
+					id: credential.id,
+					name: credential.name,
+					type: credential.type,
+					createdAt: credential.createdAt,
+					updatedAt: credential.updatedAt,
+					shared,
+				};
+			});
+
+			return res.json({
+				data,
+				nextCursor: encodeNextCursor({
+					offset,
+					limit,
+					numberOfTotalRecords: count,
+				}),
+			});
+		},
+	],
 	createCredential: [
 		validCredentialType,
 		validCredentialsProperties,
-		apiKeyHasScope('credential:create'),
+		publicApiScope('credential:create'),
 		async (
 			req: CredentialRequest.Create,
 			res: express.Response,
 		): Promise<express.Response<Partial<CredentialsEntity>>> => {
+			const savedCredential = await saveCredential(req.body, req.user);
+
+			return res.json(sanitizeCredentials(savedCredential));
+		},
+	],
+	updateCredential: [
+		validCredentialTypeForUpdate,
+		validCredentialsPropertiesForUpdate,
+		publicApiScope('credential:update'),
+		projectScope('credential:update', 'credential'),
+		async (
+			req: CredentialRequest.Update,
+			res: express.Response,
+		): Promise<express.Response<Partial<CredentialsEntity>>> => {
+			const { id: credentialId } = req.params;
+
+			const existingCredential = await getCredential(credentialId);
+			if (!existingCredential) {
+				return res.status(404).json({ message: 'Credential not found' });
+			}
+
+			if (req.body.isGlobal !== undefined && req.body.isGlobal !== existingCredential.isGlobal) {
+				if (!Container.get(LicenseState).isSharingLicensed()) {
+					return res.status(403).json({ message: 'You are not licensed for sharing credentials' });
+				}
+
+				const canShareGlobally = hasGlobalScope(req.user, 'credential:shareGlobally');
+				if (!canShareGlobally) {
+					return res.status(403).json({
+						message: 'You do not have permission to change global sharing for credentials',
+					});
+				}
+			}
+
 			try {
-				const newCredential = await createCredential(req.body);
+				const updatedCredential = await updateCredential(existingCredential, req.user, req.body);
 
-				const encryptedData = await encryptCredential(newCredential);
+				return res.json(sanitizeCredentials(updatedCredential as CredentialsEntity));
+			} catch (error) {
+				if (error instanceof CredentialsIsNotUpdatableError) {
+					return res.status(400).json({ message: error.message });
+				}
 
-				Object.assign(newCredential, encryptedData);
+				if (error instanceof ResponseError) {
+					return res.status(error.httpStatusCode).json({ message: error.message });
+				}
 
-				const savedCredential = await saveCredential(newCredential, req.user, encryptedData);
-
-				return res.json(sanitizeCredentials(savedCredential));
-			} catch ({ message, httpStatusCode }) {
-				// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-				return res.status(httpStatusCode ?? 500).json({ message });
+				const message = error instanceof Error ? error.message : 'Unknown error';
+				return res.status(500).json({ message });
 			}
 		},
 	],
 	transferCredential: [
-		apiKeyHasScope('credential:move'),
+		publicApiScope('credential:move'),
 		projectScope('credential:move', 'credential'),
 		async (req: CredentialRequest.Transfer, res: express.Response) => {
 			const body = z.object({ destinationProjectId: z.string() }).parse(req.body);
@@ -63,7 +168,7 @@ export = {
 		},
 	],
 	deleteCredential: [
-		apiKeyHasScope('credential:delete'),
+		publicApiScope('credential:delete'),
 		projectScope('credential:delete', 'credential'),
 		async (
 			req: CredentialRequest.Delete,
@@ -79,7 +184,7 @@ export = {
 					credential = shared.credentials;
 				}
 			} else {
-				credential = (await getCredentials(credentialId)) as CredentialsEntity;
+				credential = (await getCredential(credentialId)) as CredentialsEntity;
 			}
 
 			if (!credential) {
